@@ -243,6 +243,7 @@ Cleanup:
 
         ' 8. Clean up
         pSourceVoice.DestroyVoice
+        pMasterVoice.DestroyVoice
         Debug.Print "Playback complete: " & wavPath
 
         'tB doesn't properly handle novtable interfaces; 
