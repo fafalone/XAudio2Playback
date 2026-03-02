@@ -1,0 +1,256 @@
+[Description("")]
+[FormDesignerId("E88DEFC6-64B8-47EA-8EEB-D30F93E61417")]
+[PredeclaredId]
+Class Form1
+
+    Sub New()
+    End Sub
+    
+    
+    
+    Private Function PickFile(Optional ByVal sTitle As String = "Pick file") As String
+        Dim fod As FileOpenDialog
+        Set fod = New FileOpenDialog
+        Dim lpAbsPath As LongPtr
+        Dim lpPath As LongPtr
+        Dim siRes As IShellItem
+        Dim tFilt() As COMDLG_FILTERSPEC
+        ReDim tFilt(1)
+        tFilt(0).pszName = StrPtr("WAV Sound Files")
+        tFilt(0).pszSpec = StrPtr("*.wav")
+        tFilt(1).pszName = StrPtr("All Files")
+        tFilt(1).pszSpec = StrPtr("*.*")
+        With fod
+            .SetTitle sTitle
+            .SetOptions FOS_PATHMUSTEXIST
+            .SetFileTypes 2, VarPtr(tFilt(0))
+            On Error Resume Next
+            .Show Me.hWnd
+            .GetResult siRes
+            On Error GoTo 0
+            If (siRes Is Nothing) = False Then
+                'siRes.GetDisplayName SIGDN_DESKTOPABSOLUTEPARSING, lpAbsPath
+                siRes.GetDisplayName SIGDN_FILESYSPATH, lpPath
+                PickFile = LPWSTRtoStr(lpPath)
+                ' If InStr(PickFile, " ") Then
+                '     PickFile = Chr$(34) & PickFile & Chr$(34)
+                ' End If
+                    
+            End If
+            
+        End With
+    End Function
+    
+    Private Sub Command1_Click() Handles Command1.Click
+        PlayWavFile(Text1.Text)
+    End Sub
+    
+    Private Sub Command2_Click() Handles Command2.Click
+        Text1.Text = PickFile("Choose sound...")
+    End Sub
+    
+    Private Sub Form_Load() Handles Form.Load
+        SHAutoComplete(Text1.hWnd, SHACF_FILESYS_ONLY)
+    End Sub
+    
+    
+End Class
+
+Module XAudio2Example
+
+    ' --- WAV file parsing ---
+
+    ' Standard RIFF chunk header
+    Private Type RIFF_CHUNK
+        ckID   As Long    ' FourCC identifier
+        ckSize As Long    ' Size of chunk data (excluding this header)
+    End Type
+
+    ' FourCC helpers
+    Private Const FOURCC_RIFF As Long = &H46464952  ' "RIFF"
+    Private Const FOURCC_WAVE As Long = &H45564157  ' "WAVE"
+    Private Const FOURCC_fmt  As Long = &H20746D66  ' "fmt "
+    Private Const FOURCC_data As Long = &H61746164  ' "data"
+
+    ' Reads a WAV file and returns the WAVEFORMATEX and raw PCM bytes.
+    ' Supports PCM and IEEE-float WAV files (no compressed formats).
+    Private Function LoadWav( _
+            ByVal filePath As String, _
+            ByRef wfx As WAVEFORMATEX, _
+            ByRef pcmData As Byte()) As Boolean
+
+        Dim fileNum As Integer
+        fileNum = FreeFile()
+        Open filePath For Binary Access Read As #fileNum
+
+        On Error GoTo Cleanup
+
+        ' --- Read & validate the outer RIFF header ---
+        Dim riff As RIFF_CHUNK
+        Get #fileNum,, riff
+        If riff.ckID <> FOURCC_RIFF Then
+            MsgBox "Not a RIFF file: " & filePath
+            GoTo Cleanup
+        End If
+
+        Dim wavID As Long
+        Get #fileNum,, wavID
+        If wavID <> FOURCC_WAVE Then
+            MsgBox "RIFF file is not WAVE: " & filePath
+            GoTo Cleanup
+        End If
+
+        ' --- Walk chunks until we find "fmt " and "data" ---
+        Dim foundFmt  As Boolean
+        Dim foundData As Boolean
+        Dim chunk     As RIFF_CHUNK
+
+        Do While Not (foundFmt And foundData)
+
+            If EOF(fileNum) Then
+                MsgBox "Unexpected end of file (missing fmt or data chunk)"
+                GoTo Cleanup
+            End If
+
+            Get #fileNum,, chunk
+
+            Select Case chunk.ckID
+
+                Case FOURCC_fmt
+                    ' Read the WAVEFORMATEX fields we care about.
+                    ' A plain PCM fmt chunk is 16 bytes; WAVEFORMATEX adds cbSize (2 bytes).
+                    ' We read only as much as is present.
+                    Dim fmtBytesRead As Long
+                    fmtBytesRead = 0
+
+                    Dim fmtBuf() As Byte
+                    ReDim fmtBuf(0 To chunk.ckSize - 1)
+                    Get #fileNum,, fmtBuf
+                    CopyMemory wfx, fmtBuf(0), IIf(chunk.ckSize >= Len(wfx), Len(wfx), chunk.ckSize)
+                    wfx.cbSize = 0      ' we don't carry extra bytes
+
+                    ' Skip any padding byte (RIFF chunks are WORD-aligned)
+                    If (chunk.ckSize And 1) Then
+                        Seek #fileNum, Seek(fileNum) + 1
+                    End If
+
+                    foundFmt = True
+
+                Case FOURCC_data
+                    ReDim pcmData(0 To chunk.ckSize - 1)
+                    Get #fileNum,, pcmData
+                    foundData = True
+
+                Case Else
+                    ' Unknown / unneeded chunk — skip it (plus alignment byte)
+                    Dim skipBytes As Long
+                    skipBytes = chunk.ckSize + (chunk.ckSize And 1)
+                    Seek #fileNum, Seek(fileNum) + skipBytes
+
+            End Select
+        Loop
+
+        Close #fileNum
+        LoadWav = True
+        Exit Function
+
+Cleanup:
+        Close #fileNum
+        LoadWav = False
+    End Function
+
+
+    ' --- Entry point ---
+
+    Public Sub PlayWavFile(ByVal wavPath As String)
+
+        ' 1. Load the WAV file
+        Dim wfx     As WAVEFORMATEX
+        Dim pcmData() As Byte
+
+        If Not LoadWav(wavPath, wfx, pcmData) Then
+            MsgBox "Failed to load WAV file: " & wavPath
+            Exit Sub
+        End If
+
+        ' 2. Create the XAudio2 engine
+        Dim pXAudio2 As IXAudio2
+        Dim hr As Long
+
+        hr = XAudio2Create(pXAudio2, 0, XAUDIO2_DEFAULT_PROCESSOR)
+        If hr <> S_OK Then
+            MsgBox "XAudio2Create failed: 0x" & Hex(hr)
+            Exit Sub
+        End If
+
+        ' 3. Create a mastering voice
+        Dim pMasterVoice As IXAudio2MasteringVoice
+        pXAudio2.CreateMasteringVoice( _
+                pMasterVoice, _
+                XAUDIO2_DEFAULT_CHANNELS, _
+                XAUDIO2_DEFAULT_SAMPLERATE, _
+                0, 0, ByVal vbNullPtr, AudioCategory_GameEffects)
+        If hr <> S_OK Then
+            MsgBox "CreateMasteringVoice failed: 0x" & Hex(hr)
+            Exit Sub
+        End If
+
+        ' 4. Create a source voice matching the WAV's own format
+        Dim pSourceVoice As IXAudio2SourceVoice
+        pXAudio2.CreateSourceVoice( _
+                pSourceVoice, wfx, _
+                0, XAUDIO2_DEFAULT_FREQ_RATIO, _
+                Nothing, ByVal vbNullPtr, ByVal vbNullPtr)
+        If Err.LastHresult <> S_OK Then
+            MsgBox "CreateSourceVoice failed: 0x" & Hex(hr)
+            Exit Sub
+        End If
+
+        ' 5. Submit the PCM data
+        Dim xBuf As XAUDIO2_BUFFER
+        With xBuf
+            .Flags = XAUDIO2_END_OF_STREAM
+            .AudioBytes = UBound(pcmData) + 1
+            .pAudioData = VarPtr(pcmData(0))
+            .PlayBegin = 0
+            .PlayLength = 0
+            .LoopBegin = 0
+            .LoopLength = 0
+            .LoopCount = 0
+            .pContext = 0
+        End With
+
+        pSourceVoice.SubmitSourceBuffer(xBuf, ByVal vbNullPtr)
+        If Err.LastHresult <> S_OK Then
+            MsgBox "SubmitSourceBuffer failed: 0x" & Hex(hr)
+            Exit Sub
+        End If
+
+        ' 6. Start playback
+        pSourceVoice.Start(0, XAUDIO2_COMMIT_NOW)
+        If Err.LastHresult <> S_OK Then
+            MsgBox "Start failed: 0x" & Hex(hr)
+            Exit Sub
+        End If
+
+        ' 7. Wait for playback to finish
+        Dim state As XAUDIO2_VOICE_STATE
+        Do
+            pSourceVoice.GetState state, 0
+            If state.BuffersQueued = 0 Then Exit Do
+            Sleep 10
+        Loop
+
+        ' 8. Clean up
+        pSourceVoice.DestroyVoice
+        Debug.Print "Playback complete: " & wavPath
+
+        'tB doesn't properly handle novtable interfaces; 
+        'zero the pointers to prevent a crash from it calling
+        'IUnknown::Release
+        PutMemPtr VarPtr(pSourceVoice), 0
+        PutMemPtr VarPtr(pMasterVoice), 0
+        
+    End Sub
+
+End Module
